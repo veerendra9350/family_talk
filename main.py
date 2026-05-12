@@ -1,5 +1,7 @@
 import os
+import re
 import json
+import time
 import datetime
 from pathlib import Path
 
@@ -18,6 +20,8 @@ CACHE_TTL_MINUTES = int(os.getenv("CACHE_TTL_MINUTES", "60"))
 PERSONAS_DIR = Path(__file__).parent / "personas"
 CACHE_FILE = Path(__file__).parent / "cache_response.json"
 CACHE_MAX_AGE_DAYS = 7
+SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD", "5"))
+RESPONSE_DELAY_SECONDS = int(os.getenv("RESPONSE_DELAY_SECONDS", "5"))
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -35,10 +39,24 @@ def load_personas() -> dict[str, str]:
 
 # ── Context cache ─────────────────────────────────────────────────────────────
 
-_CACHE_SYSTEM = """You are an AI assistant managing a family chat room.
-The following personas are available. Each has a distinct personality, speaking style, and areas of expertise.
-You will be asked either to pick the best persona to answer a message, or to respond as a specific persona.
-Persona definitions are provided below."""
+_CACHE_SYSTEM = """You are an AI assistant managing a warm, realistic family chat room.
+The room contains several family members and close relatives, each with their own distinct personality,
+life experience, speaking style, and areas of expertise. They are all real, caring people — not robots.
+
+You will be given one of two tasks:
+
+TASK: SCORING — Given a user message and conversation history, rate each persona's relevance (0-10)
+for responding. High scores mean the persona has relevant expertise, personality fit, or a natural
+stake in the topic. Low scores mean the topic is outside their experience or interest.
+Return scores as a JSON array. Only personas scoring at or above the threshold should respond.
+
+TASK: RESPOND AS PERSONA — Stay fully in character as the named persona. Match their tone, vocabulary,
+emotional register, and speech patterns exactly as described in their definition. Use the full
+conversation history so your reply is coherent with everything said before. Never break character,
+never refer to yourself as an AI, and never describe what you are doing — just respond naturally
+as that person would in a real family chat.
+
+Persona definitions for all family members are provided below."""
 
 
 def _personas_block(personas: dict[str, str]) -> str:
@@ -115,11 +133,16 @@ def get_or_refresh_cache(personas: dict[str, str]) -> tuple[str | None, str]:
     return _create_and_save(personas, reason="new · no prior cache found")
 
 
+def _cache_model_name() -> str:
+    """The caches API requires the 'models/' prefix; the generate API does not."""
+    return GEMINI_MODEL if GEMINI_MODEL.startswith("models/") else f"models/{GEMINI_MODEL}"
+
+
 def _create_and_save(personas: dict[str, str], reason: str) -> tuple[str | None, str]:
     """Create a brand-new Gemini cache, persist it to disk, return (name, status)."""
     try:
         cache = client.caches.create(
-            model=GEMINI_MODEL,
+            model=_cache_model_name(),
             config=types.CreateCachedContentConfig(
                 system_instruction=_CACHE_SYSTEM,
                 contents=[_personas_block(personas)],
@@ -134,10 +157,15 @@ def _create_and_save(personas: dict[str, str], reason: str) -> tuple[str | None,
 
 def _cache_error_reason(exc: Exception) -> str:
     msg = str(exc)
+    if "429" in msg or "resource_exhausted" in msg.lower() or "freetier" in msg.lower().replace("_", ""):
+        return "context caching requires a paid Gemini API plan (free tier limit = 0)"
     if "404" in msg or "not found" in msg.lower():
         return f"model `{GEMINI_MODEL}` does not support context caching"
-    if "minimum" in msg.lower() or "token" in msg.lower():
-        return "persona content too short to cache (below model minimum token count)"
+    if "too small" in msg.lower() or "min_total_token_count" in msg.lower():
+        import re as _re
+        nums = _re.findall(r"\d+", msg)
+        detail = f"{nums[0]} tokens, need ≥ {nums[1]}" if len(nums) >= 2 else "content too short"
+        return f"persona content too small to cache ({detail}) — add more persona files"
     if "403" in msg or "permission" in msg.lower():
         return "API key does not have permission to use context caching"
     return f"cache creation failed: {msg[:120]}"
@@ -171,60 +199,73 @@ def _generate(
 
 # ── Router agent ──────────────────────────────────────────────────────────────
 
-def pick_persona(
+def score_personas(
     query: str,
     chat_history: list[dict],
     personas: dict[str, str],
     cache_name: str | None,
-) -> str:
+) -> list[tuple[str, int]]:
+    """
+    Ask the model to rate each persona's relevance (0-10) for this message.
+    Returns a list of (persona_name, score) sorted by score descending,
+    filtered to only those at or above SCORE_THRESHOLD.
+    Always returns at least one persona (the highest scorer) as a safety net.
+    """
     history_text = format_history_for_prompt(chat_history)
-    persona_names = ", ".join(f'"{n}"' for n in personas)
-    chosen: str | None = None
+    names_list = "\n".join(f"- {n}" for n in personas)
 
-    if cache_name:
-        prompt = f"""TASK: ROUTING
+    router_prompt = f"""TASK: SCORE PERSONAS
 
-Decide which persona ({persona_names}) is best suited to answer the user's latest message.
-Reply with ONLY the exact persona name — no explanation, no punctuation.
+Rate how relevant each persona is for responding to the user's latest message.
+Use a score from 0 (completely irrelevant / wrong expertise) to 10 (perfect fit).
+
+Personas to score:
+{names_list}
 
 Conversation so far:
 {history_text or "(No previous messages)"}
 
 User's latest message: "{query}"
 
-Persona name:"""
-        try:
-            chosen = _generate(prompt, cache_name=cache_name)
-        except Exception:
-            # Cache likely expired — fall back for rest of session.
-            st.session_state.cache_name = None
-            st.session_state.cache_status = "expired · switched to inline mode"
-            cache_name = None
+Reply with ONLY a JSON array — no explanation, no markdown fences:
+[
+  {{"persona": "Name", "score": 8}},
+  {{"persona": "Name", "score": 3}}
+]
+Include ALL personas."""
 
-    if not cache_name:
-        prompt = f"""You are a routing agent for a family chat room.
-Decide which persona is best suited to answer the user's latest message.
+    try:
+        if cache_name:
+            try:
+                raw = _generate(router_prompt, cache_name=cache_name)
+            except Exception:
+                st.session_state.cache_name = None
+                st.session_state.cache_status = "expired · switched to inline mode"
+                cache_name = None
+                raw = _generate(router_prompt)
+        else:
+            raw = _generate(router_prompt)
 
-Available personas:
-{_personas_block(personas)}
+        # Pull the JSON array out of the response even if there's surrounding text.
+        match = re.search(r"\[.*?\]", raw, re.DOTALL)
+        if not match:
+            raise ValueError("no JSON array in response")
+        data = json.loads(match.group())
 
----
-Conversation so far:
-{history_text or "(No previous messages)"}
+        scored = [
+            (item["persona"], int(item["score"]))
+            for item in data
+            if item.get("persona") in personas
+        ]
+        scored.sort(key=lambda x: x[1], reverse=True)
 
-User's latest message: "{query}"
+        above = [(n, s) for n, s in scored if s >= SCORE_THRESHOLD]
+        # Always keep at least the highest scorer so nobody is left silent.
+        return above if above else scored[:1]
 
-Reply with ONLY the exact persona name (e.g. {persona_names}).
-No explanation, no punctuation — just the name."""
-        chosen = _generate(prompt)
-
-    assert chosen is not None
-    if chosen not in personas:
-        for name in personas:
-            if name.lower() in chosen.lower():
-                return name
-        return next(iter(personas))
-    return chosen
+    except Exception:
+        # Hard fallback: return the first persona with a nominal score.
+        return [(next(iter(personas)), 10)]
 
 
 # ── Response agent ────────────────────────────────────────────────────────────
@@ -355,26 +396,39 @@ if user_input := st.chat_input("Say something…"):
         st.markdown(user_input)
     st.session_state.messages.append({"role": "user", "content": user_input})
 
-    with st.spinner("Thinking…"):
-        cache_name = st.session_state.cache_name
-        chosen_persona = pick_persona(
+    cache_name = st.session_state.cache_name
+
+    # Score all personas; may return multiple above threshold.
+    with st.spinner("Figuring out who wants to reply…"):
+        scored = score_personas(
             user_input,
             st.session_state.messages[:-1],
             personas,
             cache_name,
         )
-        reply = generate_response(
-            user_input,
-            st.session_state.messages[:-1],
-            chosen_persona,
-            personas[chosen_persona],
-            cache_name,
+
+    # Each persona replies in turn, highest score first, with a typing effect.
+    for i, (persona_name, score) in enumerate(scored):
+        with st.chat_message("assistant", avatar="🧑"):
+            name_line = st.markdown(f"**{persona_name}** ✍️ *typing…*")
+            body = st.empty()
+
+            reply = generate_response(
+                user_input,
+                st.session_state.messages[:-1],
+                persona_name,
+                personas[persona_name],
+                cache_name,
+            )
+
+            # Replace the typing indicator with the actual message.
+            name_line.markdown(f"**{persona_name}**")
+            body.markdown(reply)
+
+        st.session_state.messages.append(
+            {"role": "assistant", "content": reply, "persona": persona_name}
         )
 
-    with st.chat_message("assistant", avatar="🧑"):
-        st.markdown(f"**{chosen_persona}**")
-        st.markdown(reply)
-
-    st.session_state.messages.append(
-        {"role": "assistant", "content": reply, "persona": chosen_persona}
-    )
+        # Pause before the next person chimes in (skip after the last reply).
+        if i < len(scored) - 1:
+            time.sleep(RESPONSE_DELAY_SECONDS)
