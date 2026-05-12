@@ -1,0 +1,13 @@
+[project]
+name = "family-talk"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-genai>=1.0.0",
+    "google-generativeai>=0.8.0",
+    "python-dotenv>=1.0.0",
+    "streamlit>=1.35.0",
+    "watchdog>=6.0.0",
+]
