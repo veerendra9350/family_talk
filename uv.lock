@@ -317,7 +317,7 @@ requires-dist = [
     { name = "google-genai", specifier = ">=1.0.0" },
     { name = "google-generativeai", specifier = ">=0.8.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
-    { name = "streamlit", specifier = ">=1.35.0" },
+    { name = "streamlit", specifier = ">=1.37.0" },
     { name = "watchdog", specifier = ">=6.0.0" },
 ]
 

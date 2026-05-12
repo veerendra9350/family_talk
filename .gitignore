@@ -12,5 +12,6 @@ wheels/
 # Secrets
 .env
 
-# Gemini cache state (local only)
+# Gemini cache state and logs (local only)
 cache_response.json
+family_talk.log

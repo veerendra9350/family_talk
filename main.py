@@ -2,7 +2,10 @@ import os
 import re
 import json
 import time
+import queue
+import logging
 import datetime
+import threading
 from pathlib import Path
 
 import streamlit as st
@@ -15,15 +18,29 @@ load_dotenv()
 # ── Config ────────────────────────────────────────────────────────────────────
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 CACHE_TTL_MINUTES = int(os.getenv("CACHE_TTL_MINUTES", "60"))
 PERSONAS_DIR = Path(__file__).parent / "personas"
 CACHE_FILE = Path(__file__).parent / "cache_response.json"
+LOG_FILE = Path(__file__).parent / "family_talk.log"
 CACHE_MAX_AGE_DAYS = 7
 SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD", "5"))
 RESPONSE_DELAY_SECONDS = int(os.getenv("RESPONSE_DELAY_SECONDS", "5"))
 
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("family_talk")
 
 # ── Persona loading ───────────────────────────────────────────────────────────
 
@@ -81,7 +98,6 @@ def _write_cache_file(cache_name: str) -> None:
 
 
 def _cache_file_is_fresh(entry: dict) -> bool:
-    """True if the entry is < CACHE_MAX_AGE_DAYS old AND was created for the current model."""
     try:
         if entry.get("model") != GEMINI_MODEL:
             return False
@@ -92,7 +108,6 @@ def _cache_file_is_fresh(entry: dict) -> bool:
 
 
 def _verify_cache_live(cache_name: str) -> bool:
-    """Ping Gemini to confirm the cache ID still exists."""
     try:
         client.caches.get(name=cache_name)
         return True
@@ -103,16 +118,6 @@ def _verify_cache_live(cache_name: str) -> bool:
 # ── Cache orchestration ───────────────────────────────────────────────────────
 
 def get_or_refresh_cache(personas: dict[str, str]) -> tuple[str | None, str]:
-    """
-    Decision tree (no network call unless something fails):
-      1. cache_response.json missing              → create new cache
-      2. entry older than CACHE_MAX_AGE_DAYS      → create new cache
-      3. model in file ≠ current GEMINI_MODEL     → create new cache
-      4. Gemini says cache ID is gone             → create new cache
-      5. All checks pass                          → reuse existing cache
-
-    Returns (cache_name_or_None, human-readable status string).
-    """
     entry = _read_cache_file()
 
     if entry:
@@ -120,12 +125,13 @@ def get_or_refresh_cache(personas: dict[str, str]) -> tuple[str | None, str]:
             reason = (
                 f"model changed to `{GEMINI_MODEL}`"
                 if entry.get("model") != GEMINI_MODEL
-                else f"cache file is older than {CACHE_MAX_AGE_DAYS} days"
+                else f"cache file older than {CACHE_MAX_AGE_DAYS} days"
             )
             return _create_and_save(personas, reason="refreshed · " + reason)
 
         if _verify_cache_live(entry["cache_name"]):
             created = entry.get("created_at", "")[:10]
+            logger.info(f"Reusing existing cache {entry['cache_name']} (created {created})")
             return entry["cache_name"], f"reused · created {created} · `{entry['cache_name']}`"
         else:
             return _create_and_save(personas, reason="refreshed · previous cache expired in Gemini")
@@ -134,13 +140,12 @@ def get_or_refresh_cache(personas: dict[str, str]) -> tuple[str | None, str]:
 
 
 def _cache_model_name() -> str:
-    """The caches API requires the 'models/' prefix; the generate API does not."""
     return GEMINI_MODEL if GEMINI_MODEL.startswith("models/") else f"models/{GEMINI_MODEL}"
 
 
 def _create_and_save(personas: dict[str, str], reason: str) -> tuple[str | None, str]:
-    """Create a brand-new Gemini cache, persist it to disk, return (name, status)."""
     try:
+        logger.info(f"Creating new Gemini cache ({reason})")
         cache = client.caches.create(
             model=_cache_model_name(),
             config=types.CreateCachedContentConfig(
@@ -150,9 +155,12 @@ def _create_and_save(personas: dict[str, str], reason: str) -> tuple[str | None,
             ),
         )
         _write_cache_file(cache.name)
+        logger.info(f"Cache created: {cache.name}")
         return cache.name, f"{reason} · TTL {CACHE_TTL_MINUTES} min · `{cache.name}`"
     except Exception as exc:
-        return None, _cache_error_reason(exc)
+        msg = _cache_error_reason(exc)
+        logger.warning(f"Cache creation failed: {msg}")
+        return None, msg
 
 
 def _cache_error_reason(exc: Exception) -> str:
@@ -178,11 +186,6 @@ def _generate(
     cache_name: str | None = None,
     system_instruction: str = "",
 ) -> str:
-    """
-    Single call point for all Gemini requests.
-    - With cache_name: attaches cached content (no system_instruction allowed alongside it).
-    - Without cache_name: optionally accepts a system_instruction for inline mode.
-    """
     config_kwargs: dict = {}
     if cache_name:
         config_kwargs["cached_content"] = cache_name
@@ -205,12 +208,6 @@ def score_personas(
     personas: dict[str, str],
     cache_name: str | None,
 ) -> list[tuple[str, int]]:
-    """
-    Ask the model to rate each persona's relevance (0-10) for this message.
-    Returns a list of (persona_name, score) sorted by score descending,
-    filtered to only those at or above SCORE_THRESHOLD.
-    Always returns at least one persona (the highest scorer) as a safety net.
-    """
     history_text = format_history_for_prompt(chat_history)
     names_list = "\n".join(f"- {n}" for n in personas)
 
@@ -238,7 +235,8 @@ Include ALL personas."""
         if cache_name:
             try:
                 raw = _generate(router_prompt, cache_name=cache_name)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Cache miss on scoring, falling back to inline: {e}")
                 st.session_state.cache_name = None
                 st.session_state.cache_status = "expired · switched to inline mode"
                 cache_name = None
@@ -246,10 +244,9 @@ Include ALL personas."""
         else:
             raw = _generate(router_prompt)
 
-        # Pull the JSON array out of the response even if there's surrounding text.
         match = re.search(r"\[.*?\]", raw, re.DOTALL)
         if not match:
-            raise ValueError("no JSON array in response")
+            raise ValueError("no JSON array in scoring response")
         data = json.loads(match.group())
 
         scored = [
@@ -258,13 +255,11 @@ Include ALL personas."""
             if item.get("persona") in personas
         ]
         scored.sort(key=lambda x: x[1], reverse=True)
-
         above = [(n, s) for n, s in scored if s >= SCORE_THRESHOLD]
-        # Always keep at least the highest scorer so nobody is left silent.
         return above if above else scored[:1]
 
-    except Exception:
-        # Hard fallback: return the first persona with a nominal score.
+    except Exception as e:
+        logger.error(f"score_personas failed: {e}")
         return [(next(iter(personas)), 10)]
 
 
@@ -295,12 +290,12 @@ User: {query}
 Respond as {persona_name}:"""
         try:
             return _generate(prompt, cache_name=cache_name)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Cache miss on response, falling back: {e}")
             st.session_state.cache_name = None
             st.session_state.cache_status = "expired · switched to inline mode"
             cache_name = None
 
-    # Inline fallback: persona definition goes into system_instruction.
     system_prompt = f"""You are roleplaying as the following person in a family chat room.
 Stay fully in character at all times.
 
@@ -334,10 +329,57 @@ def format_history_for_prompt(chat_history: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# ── Background message processor ─────────────────────────────────────────────
+
+def _process_message(
+    user_input: str,
+    history_snap: list[dict],
+    personas_snap: dict[str, str],
+    cache_name: str | None,
+    response_q: "queue.Queue[dict]",
+) -> None:
+    """
+    Runs in a daemon thread.
+    Puts dicts into response_q:
+      {"type": "typing",  "persona": str}          — persona is about to reply
+      {"type": "reply",   "persona": str, "content": str}  — finished reply
+      {"type": "error",   "persona": str, "content": str}  — something went wrong
+      {"type": "done"}                              — all personas finished
+    """
+    logger.info(f"► Message received: {user_input[:80]!r}")
+    try:
+        scored = score_personas(user_input, history_snap, personas_snap, cache_name)
+        logger.info(f"  Scores: {[(p, s) for p, s in scored]}")
+
+        for i, (persona_name, score) in enumerate(scored):
+            response_q.put({"type": "typing", "persona": persona_name})
+            logger.info(f"  {persona_name} (score={score}) generating…")
+
+            try:
+                reply = generate_response(
+                    user_input, history_snap, persona_name,
+                    personas_snap[persona_name], cache_name,
+                )
+                response_q.put({"type": "reply", "persona": persona_name, "content": reply})
+                logger.info(f"  {persona_name} replied ({len(reply)} chars)")
+            except Exception as exc:
+                logger.error(f"  {persona_name} response error: {exc}")
+                response_q.put({"type": "error", "persona": persona_name, "content": str(exc)})
+
+            if i < len(scored) - 1:
+                logger.info(f"  Pausing {RESPONSE_DELAY_SECONDS}s before next persona")
+                time.sleep(RESPONSE_DELAY_SECONDS)
+
+    except Exception as exc:
+        logger.error(f"  Fatal processing error: {exc}")
+    finally:
+        response_q.put({"type": "done"})
+        logger.info("► Message processing complete")
+
+
 # ── Streamlit UI ──────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Family Talk", page_icon="💬", layout="centered")
-
 st.title("💬 Family Talk")
 st.caption("A chat room where different family personas respond based on your message.")
 
@@ -347,10 +389,11 @@ if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
 
 personas = load_personas()
 if not personas:
-    st.error(f"No persona `.md` files found in `{PERSONAS_DIR}`. Add some to get started.")
+    st.error(f"No persona `.md` files found in `{PERSONAS_DIR}`.")
     st.stop()
 
-# ── Cache: check file first, only hit Gemini API if needed ───────────────────
+# ── Session state init ────────────────────────────────────────────────────────
+
 if "cache_name" not in st.session_state:
     with st.spinner("Checking persona cache…"):
         cache_name, cache_status = get_or_refresh_cache(personas)
@@ -360,7 +403,18 @@ if "cache_name" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "response_queue" not in st.session_state:
+    # thread.Queue lives in session state; survives reruns, safe to put() from threads
+    st.session_state.response_queue = queue.Queue()
+
+if "typing_persona" not in st.session_state:
+    st.session_state.typing_persona = None
+
+if "active_threads" not in st.session_state:
+    st.session_state.active_threads = 0
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
+
 with st.sidebar:
     st.header("Personas in the room")
     for name, content in personas.items():
@@ -368,7 +422,7 @@ with st.sidebar:
             st.markdown(content)
 
     st.divider()
-    st.subheader("Persona cache")
+    st.subheader("Cache")
     if st.session_state.cache_name:
         st.success(st.session_state.cache_status)
     else:
@@ -376,59 +430,110 @@ with st.sidebar:
 
     st.caption(f"Model: `{GEMINI_MODEL}`")
 
+    st.divider()
+    st.subheader("Logs")
+    st.caption(f"`{LOG_FILE.name}` in project root")
+    if LOG_FILE.exists():
+        lines = LOG_FILE.read_text(encoding="utf-8").splitlines()
+        st.text_area(
+            label="last 30 lines",
+            value="\n".join(lines[-30:]),
+            height=250,
+            disabled=True,
+            key="log_display",
+            label_visibility="collapsed",
+        )
+    else:
+        st.caption("No log file yet.")
+
     if st.button("Clear chat"):
         st.session_state.messages = []
+        st.session_state.typing_persona = None
+        # Drain any leftover queue items
+        while not st.session_state.response_queue.empty():
+            try:
+                st.session_state.response_queue.get_nowait()
+            except queue.Empty:
+                break
         st.rerun()
 
-# ── Chat history ──────────────────────────────────────────────────────────────
-for msg in st.session_state.messages:
-    if msg["role"] == "user":
-        with st.chat_message("user"):
-            st.markdown(msg["content"])
-    else:
+# ── Chat display (auto-polls every second for new replies) ────────────────────
+
+@st.fragment(run_every=1)
+def chat_display() -> None:
+    """
+    Polls response_queue every second.
+    Typing events show a '…is typing' bubble.
+    Reply events commit the message to session_state.messages.
+    Done event clears the typing indicator.
+    """
+    # Drain everything currently in the queue
+    while True:
+        try:
+            item = st.session_state.response_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        t = item["type"]
+        if t == "typing":
+            st.session_state.typing_persona = item["persona"]
+        elif t == "reply":
+            st.session_state.typing_persona = None
+            st.session_state.messages.append({
+                "role": "assistant",
+                "persona": item["persona"],
+                "content": item["content"],
+            })
+        elif t == "error":
+            # Clear the typing indicator but don't pollute the chat with API errors.
+            # Full error is written to the log file.
+            st.session_state.typing_persona = None
+        elif t == "done":
+            st.session_state.typing_persona = None
+            st.session_state.active_threads = max(0, st.session_state.active_threads - 1)
+
+    # Render committed messages
+    for msg in st.session_state.messages:
+        if msg["role"] == "user":
+            with st.chat_message("user"):
+                st.markdown(msg["content"])
+        else:
+            with st.chat_message("assistant", avatar="🧑"):
+                st.markdown(f"**{msg['persona']}**")
+                st.markdown(msg["content"])
+
+    # Typing indicator
+    if st.session_state.typing_persona:
         with st.chat_message("assistant", avatar="🧑"):
-            st.markdown(f"**{msg['persona']}**")
-            st.markdown(msg["content"])
+            st.markdown(f"**{st.session_state.typing_persona}** *is typing…*")
+    elif st.session_state.active_threads > 0:
+        st.caption("⏳ Someone is still thinking…")
+
+
+chat_display()
 
 # ── Chat input ────────────────────────────────────────────────────────────────
+
 if user_input := st.chat_input("Say something…"):
-    with st.chat_message("user"):
-        st.markdown(user_input)
+    # Snapshot history before appending the new message
+    history_snap = list(st.session_state.messages)
+
+    # Commit the user message immediately
     st.session_state.messages.append({"role": "user", "content": user_input})
 
-    cache_name = st.session_state.cache_name
-
-    # Score all personas; may return multiple above threshold.
-    with st.spinner("Figuring out who wants to reply…"):
-        scored = score_personas(
+    # Spin up a background thread — returns immediately, input stays live
+    st.session_state.active_threads += 1
+    threading.Thread(
+        target=_process_message,
+        args=(
             user_input,
-            st.session_state.messages[:-1],
-            personas,
-            cache_name,
-        )
+            history_snap,
+            dict(personas),
+            st.session_state.cache_name,
+            st.session_state.response_queue,
+        ),
+        daemon=True,
+    ).start()
 
-    # Each persona replies in turn, highest score first, with a typing effect.
-    for i, (persona_name, score) in enumerate(scored):
-        with st.chat_message("assistant", avatar="🧑"):
-            name_line = st.markdown(f"**{persona_name}** ✍️ *typing…*")
-            body = st.empty()
-
-            reply = generate_response(
-                user_input,
-                st.session_state.messages[:-1],
-                persona_name,
-                personas[persona_name],
-                cache_name,
-            )
-
-            # Replace the typing indicator with the actual message.
-            name_line.markdown(f"**{persona_name}**")
-            body.markdown(reply)
-
-        st.session_state.messages.append(
-            {"role": "assistant", "content": reply, "persona": persona_name}
-        )
-
-        # Pause before the next person chimes in (skip after the last reply).
-        if i < len(scored) - 1:
-            time.sleep(RESPONSE_DELAY_SECONDS)
+    logger.info(f"Queued message (active threads: {st.session_state.active_threads})")
+    st.rerun()
